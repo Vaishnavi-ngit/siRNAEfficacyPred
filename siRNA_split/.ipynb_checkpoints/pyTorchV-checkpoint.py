@@ -1,0 +1,471 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.nn import HeteroConv, SAGEConv, Linear, LayerNorm, GATConv
+from torch.nn import BatchNorm1d, Dropout
+from torch_geometric.loader import DataLoader
+from torch_geometric.loader import NeighborLoader
+from torch_geometric.transforms import AddSelfLoops
+from torch_geometric.transforms import ToUndirected
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, roc_auc_score
+import scipy.stats
+import json
+import math
+import re
+import utils as utils1
+
+# Load parameters
+params = json.load(open("siRNA_param.json", 'r'))
+
+# Initialize metric lists
+score_PCC = []
+score_SPCC = []
+score_mse = []
+score_auc = []
+
+class ImprovedHeteroGNN(torch.nn.Module):
+    def __init__(self, layer_sizes, out_channels, metadata, node_feature_dims, dropout_rate=0.3, use_attention=True):
+        super().__init__()
+        
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+        self.node_types = metadata[0]
+        self.use_attention = use_attention
+        
+        # Input projection layers for each node type to normalize dimensions
+        self.input_projections = nn.ModuleDict()
+        for node_type in self.node_types:
+            if node_type in node_feature_dims:
+                self.input_projections[node_type] = Linear(node_feature_dims[node_type], layer_sizes[0])
+        
+        for i in range(len(layer_sizes)):
+            in_channels = layer_sizes[i - 1] if i > 0 else layer_sizes[0]  # Use first layer size instead of -1
+            out_channels_i = layer_sizes[i]
+            
+            # Use attention-based convolution for better representation learning
+            if use_attention and i < len(layer_sizes) - 1:  # Use GAT for intermediate layers
+                conv = HeteroConv({
+                    ('siRNA', 'interacts_with', 'interaction'): GATConv(
+                        in_channels, out_channels_i, heads=4, concat=False, 
+                        dropout=dropout_rate, add_self_loops=False
+                    ),
+                    ('mRNA', 'interacts_with', 'interaction'): GATConv(
+                        in_channels, out_channels_i, heads=4, concat=False, 
+                        dropout=dropout_rate, add_self_loops=False
+                    ),
+                    ('interaction', 'rev_interacts_with', 'siRNA'): GATConv(
+                        in_channels, out_channels_i, heads=4, concat=False, 
+                        dropout=dropout_rate, add_self_loops=False
+                    ),
+                    ('interaction', 'rev_interacts_with', 'mRNA'): GATConv(
+                        in_channels, out_channels_i, heads=4, concat=False, 
+                        dropout=dropout_rate, add_self_loops=False
+                    ),
+                }, aggr='mean')
+            else:  # Use SAGE for final layers
+                conv = HeteroConv({
+                    ('siRNA', 'interacts_with', 'interaction'): SAGEConv(
+                        in_channels, out_channels_i, normalize=True
+                    ),
+                    ('mRNA', 'interacts_with', 'interaction'): SAGEConv(
+                        in_channels, out_channels_i, normalize=True
+                    ),
+                    ('interaction', 'rev_interacts_with', 'siRNA'): SAGEConv(
+                        in_channels, out_channels_i, normalize=True
+                    ),
+                    ('interaction', 'rev_interacts_with', 'mRNA'): SAGEConv(
+                        in_channels, out_channels_i, normalize=True
+                    ),
+                }, aggr='mean')
+            
+            self.convs.append(conv)
+            
+            # Use LayerNorm instead of BatchNorm for better stability
+            self.norms.append(nn.ModuleDict({
+                node_type: LayerNorm(out_channels_i) for node_type in self.node_types
+            }))
+            
+            self.dropouts.append(Dropout(dropout_rate))
+        
+        # Multi-layer prediction head with residual connections
+        self.prediction_head = nn.Sequential(
+            Linear(layer_sizes[-1], layer_sizes[-1] // 2),
+            nn.LeakyReLU(negative_slope=0.2),
+            Dropout(dropout_rate),
+            Linear(layer_sizes[-1] // 2, layer_sizes[-1] // 4),
+            nn.LeakyReLU(negative_slope=0.2),
+            Dropout(dropout_rate),
+            Linear(layer_sizes[-1] // 4, out_channels)
+        )
+        
+        # Skip connection projection
+        self.skip_projection = Linear(layer_sizes[0], layer_sizes[-1]) if len(layer_sizes) > 1 else None
+        
+        # Initialize weights properly
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, Linear):
+            torch.nn.init.xavier_uniform_(module.weight, gain=1.414)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+    
+    def forward(self, x_dict, edge_index_dict):
+        # Apply input projections to standardize dimensions
+        for node_type in x_dict:
+            if node_type in self.input_projections:
+                x_dict[node_type] = self.input_projections[node_type](x_dict[node_type])
+        
+        # Store initial representation for skip connection
+        initial_x = x_dict['interaction'].clone() if self.skip_projection else None
+        
+        for i, (conv, norm_dict, dropout) in enumerate(zip(self.convs, self.norms, self.dropouts)):
+            x_dict_new = conv(x_dict, edge_index_dict)
+            
+            for node_type in x_dict_new:
+                if node_type in norm_dict:
+                    x_dict_new[node_type] = norm_dict[node_type](x_dict_new[node_type])
+                
+                # Use ELU activation for better gradient flow
+                x_dict_new[node_type] = F.elu(x_dict_new[node_type])
+                x_dict_new[node_type] = dropout(x_dict_new[node_type])
+            
+            x_dict = x_dict_new
+        
+        interaction_emb = x_dict['interaction']
+        
+        # Add skip connection if applicable
+        if self.skip_projection is not None and initial_x is not None:
+            skip_connection = self.skip_projection(initial_x)
+            interaction_emb = interaction_emb + skip_connection
+        
+        return self.prediction_head(interaction_emb)
+    
+    def l1_loss(self):
+        return sum(p.abs().sum() for p in self.parameters() if p.requires_grad)
+
+class EarlyStopping:
+    def __init__(self, patience=15, min_delta=1e-6):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float('inf')
+        
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
+
+# Efficient training function with gradient clipping
+def train_epoch(model, train_loader, optimizer, criterion, device, l1_lambda=1e-5, clip_grad=1.0):
+    model.train()
+    total_loss = 0
+    num_batches = 0
+    
+    for batch in train_loader:
+        batch = batch.to(device)
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+        
+        batch_size = batch['interaction'].num_nodes
+        batch_indices = torch.arange(batch_size, device=device)
+        
+        out = model(batch.x_dict, batch.edge_index_dict)
+        loss = criterion(out[batch_indices].squeeze(-1), batch['interaction'].y[batch_indices])
+        
+        # Add L1 regularization
+        if l1_lambda > 0:
+            loss += l1_lambda * model.l1_loss()
+        
+        loss.backward()
+        
+        # Gradient clipping for stability
+        if clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        
+        optimizer.step()
+        total_loss += loss.item()
+        num_batches += 1
+    
+    return total_loss / max(num_batches, 1)
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    preds, truths = [], []
+    
+    for batch in loader:
+        batch = batch.to(device)
+        batch_size = batch['interaction'].num_nodes
+        batch_indices = torch.arange(batch_size, device=device)
+        
+        out = model(batch.x_dict, batch.edge_index_dict)
+        preds.append(out[batch_indices].cpu())
+        truths.append(batch['interaction'].y[batch_indices].cpu())
+    
+    return torch.cat(preds), torch.cat(truths)
+
+print(f"Dropout: {params['dropout']}")
+print(f"Learning Rate: {params['lr']}")
+print(f"Epochs: {params['epochs']}")
+
+for n in range(10):
+    print(f"Processing fold {n}")
+    
+    # Read and preprocess data
+    data_train = pd.read_csv(f"siRNA_split_datasets/split{n}/train.csv")
+    data_dev = pd.read_csv(f"siRNA_split_datasets/split{n}/dev.csv")
+    data_test = pd.read_csv(f"siRNA_split_datasets/split{n}/test.csv")
+    
+    data_train['split'] = 'train'
+    data_dev['split'] = 'dev' 
+    data_test['split'] = 'test'
+    
+    # Substitute U to T
+    for df in [data_train, data_dev, data_test]:
+        df['siRNA_seq'] = df['siRNA_seq'].str.replace('U', 'T')
+    
+    data = pd.concat([data_train, data_dev, data_test], axis=0)
+    
+    # Feature processing (keeping your original preprocessing)
+    # one-hot
+    sirna_onehot = [utils1.obtain_one_hot_feature_for_one_sequence_1(seq,params["sirna_length"]) for seq in data['siRNA_seq']]
+    sirna_onehot = pd.DataFrame(sirna_onehot,index=list(data['siRNA']))
+
+    mrna_onehot_temp = data.loc[:,['mRNA','mRNA_seq']]
+    mrna_onehot_temp = mrna_onehot_temp.drop_duplicates(subset="mRNA")
+
+    mrna_onehot = [utils1.obtain_one_hot_feature_for_one_sequence_1(seq,params["max_mrna_len"]) for seq in mrna_onehot_temp['mRNA_seq']]
+    mrna_onehot = pd.DataFrame(mrna_onehot,index = list(mrna_onehot_temp['mRNA']))
+
+    # Positional encoding
+    trans_table = str.maketrans('ATCG', 'TAGC')
+    data['match_pos'] = [seq[::-1].upper().translate(trans_table) for seq in data['siRNA_seq']]
+    data['match_pos'] = data.apply(lambda row: row['mRNA_seq'].index(row['match_pos']),axis = 1)
+
+    sirna_pos_encoding = [utils1.get_pos_embedding_sequence(num,params["sirna_length"],params["dmodel"]) for num in data['match_pos']]
+    sirna_pos_encoding = pd.DataFrame(sirna_pos_encoding,index = list(data['siRNA']))
+
+    # Thermodynamics
+    sirna_thermo_feat = [utils1.cal_thermo_feature(seq.replace("T","U")) for seq in data['siRNA_seq']]
+    sirna_thermo_feat = pd.DataFrame(sirna_thermo_feat).reset_index(drop=True)
+    sirna_thermo_feat = pd.concat([data['siRNA'].reset_index(drop=True),
+                                   data['mRNA'].reset_index(drop=True),
+                                   sirna_thermo_feat], axis = 1)
+    sirna_thermo_feat['index'] = sirna_thermo_feat['siRNA'] + '_' + sirna_thermo_feat['mRNA']
+    sirna_thermo_feat = sirna_thermo_feat.set_index('index').drop(columns=['siRNA', 'mRNA'])
+
+    # Co-fold features
+    con_feat = pd.read_csv("siRNA_split_preprocess/con_matrix.txt",header=None,index_col=0)
+    con_feat = con_feat.reindex(sirna_thermo_feat.index)
+
+    # sel-fold features
+    sirna_sfold_feat = pd.read_csv("siRNA_split_preprocess/self_siRNA_matrix.txt",header=None,index_col=0)
+    sirna_sfold_feat = sirna_sfold_feat.reindex(sirna_onehot.index)
+
+    mrna_sfold_feat = pd.read_csv("siRNA_split_preprocess/self_mRNA_matrix.txt",header=None,index_col=0)
+    mrna_sfold_feat = mrna_sfold_feat.reindex(mrna_onehot.index)
+
+    # GC percentage
+    sirna_GC = [utils1.countGC(seq) for seq in data['siRNA_seq']]
+    sirna_GC = pd.DataFrame(sirna_GC,index=list(data['siRNA']))
+
+    mrna_GC = [utils1.countGC(seq) for seq in mrna_onehot_temp['mRNA_seq']]
+    mrna_GC = pd.DataFrame(mrna_GC, index=list(mrna_onehot_temp['mRNA']))
+
+    # k-mers
+    sirna_1_mer = pd.DataFrame([utils1.single_freq(seq) for seq in data['siRNA_seq']])
+    sirna_2_mers = pd.DataFrame([utils1.double_freq(seq) for seq in data['siRNA_seq']])
+    sirna_3_mers = pd.DataFrame([utils1.triple_freq(seq) for seq in data['siRNA_seq']])
+    sirna_4_mers = pd.DataFrame([utils1.quadruple_freq(seq) for seq in data['siRNA_seq']])
+    sirna_5_mers = pd.DataFrame([utils1.quintuple_freq(seq) for seq in data['siRNA_seq']])
+
+    sirna_k_mers = pd.concat([sirna_1_mer,sirna_2_mers, sirna_3_mers,sirna_4_mers,sirna_5_mers], axis = 1)
+    sirna_k_mers.index = data['siRNA']
+
+    # siRNA rules codes
+    sirna_pos_scores = [utils1.rules_scores(seq) for seq in data['siRNA_seq']]
+    sirna_pos_scores = pd.DataFrame(sirna_pos_scores, index = list(data['siRNA']))
+
+    # Node features
+    sirna_pd = pd.concat([sirna_onehot,sirna_sfold_feat,sirna_GC,sirna_k_mers,sirna_pos_scores],axis = 1)
+    mrna_pd = pd.concat([mrna_onehot,mrna_sfold_feat,mrna_GC],axis = 1)
+
+    # Interactive nodes
+    sirna_pos_encoding.index = sirna_thermo_feat.index
+    interaction_pd = pd.concat([sirna_thermo_feat,con_feat,sirna_pos_encoding],axis=1)
+    
+    # Create heterogeneous graph data
+    data_hetero = HeteroData()
+    
+    # Add node features with proper normalization
+    data_hetero['siRNA'].x = torch.tensor(sirna_pd.values, dtype=torch.float)
+    data_hetero['mRNA'].x = torch.tensor(mrna_pd.values, dtype=torch.float)  
+    data_hetero['interaction'].x = torch.tensor(interaction_pd.values, dtype=torch.float)
+    
+    # Normalize features
+    for node_type in ['siRNA', 'mRNA', 'interaction']:
+        x = data_hetero[node_type].x
+        mean = x.mean(dim=0, keepdim=True)
+        std = x.std(dim=0, keepdim=True) + 1e-8
+        data_hetero[node_type].x = (x - mean) / std
+    
+    # Create mappings and edges (keeping your logic)
+    sirna_idx = {name: i for i, name in enumerate(sirna_pd.index)}
+    mrna_idx = {name: i for i, name in enumerate(mrna_pd.index)}
+    interaction_idx = {name: i for i, name in enumerate(interaction_pd.index)}
+    
+    edge_index_siRNA_to_interaction = []
+    edge_index_mRNA_to_interaction = []
+    
+    for _, row in data.iterrows():
+        interaction_name = f"{row['siRNA']}_{row['mRNA']}"
+        edge_index_siRNA_to_interaction.append([sirna_idx[row['siRNA']], interaction_idx[interaction_name]])
+        edge_index_mRNA_to_interaction.append([mrna_idx[row['mRNA']], interaction_idx[interaction_name]])
+    
+    data_hetero['siRNA', 'interacts_with', 'interaction'].edge_index = torch.tensor(
+        edge_index_siRNA_to_interaction, dtype=torch.long).t().contiguous()
+    data_hetero['mRNA', 'interacts_with', 'interaction'].edge_index = torch.tensor(
+        edge_index_mRNA_to_interaction, dtype=torch.long).t().contiguous()
+    
+    data_hetero['interaction', 'rev_interacts_with', 'siRNA'].edge_index = data_hetero['siRNA', 'interacts_with', 'interaction'].edge_index.flip([0])
+    data_hetero['interaction', 'rev_interacts_with', 'mRNA'].edge_index = data_hetero['mRNA', 'interacts_with', 'interaction'].edge_index.flip([0])
+    
+    # Create split indices
+    interaction_idx = {f"{row.siRNA}_{row.mRNA}": i for i, row in enumerate(data.itertuples())}
+    
+    train_idx = torch.tensor([interaction_idx[f"{row['siRNA']}_{row['mRNA']}"] for _, row in data_train.iterrows()], dtype=torch.long)
+    dev_idx = torch.tensor([interaction_idx[f"{row['siRNA']}_{row['mRNA']}"] for _, row in data_dev.iterrows()], dtype=torch.long)
+    test_idx = torch.tensor([interaction_idx[f"{row['siRNA']}_{row['mRNA']}"] for _, row in data_test.iterrows()], dtype=torch.long)
+    
+    data_hetero = ToUndirected()(data_hetero)
+    
+    # Create labels
+    labels = torch.zeros(data_hetero['interaction'].num_nodes, dtype=torch.float)
+    for _, row in data.iterrows():
+        interaction_name = f"{row['siRNA']}_{row['mRNA']}"
+        labels[interaction_idx[interaction_name]] = row['efficacy']
+    data_hetero['interaction'].y = labels
+    
+    # Create data loaders with better configuration
+    train_loader = NeighborLoader(
+        data_hetero, num_neighbors=params["hop_samples"], batch_size=params["batch_size"],
+        input_nodes=('interaction', train_idx), shuffle=True, subgraph_type='induced',
+        filter_per_worker=False, num_workers=0  # Avoid multiprocessing issues
+    )
+    
+    val_loader = NeighborLoader(
+        data_hetero, num_neighbors=params["hop_samples"], batch_size=params["batch_size"],
+        input_nodes=('interaction', dev_idx), shuffle=False, subgraph_type='induced',
+        filter_per_worker=False, num_workers=0
+    )
+    
+    test_loader = NeighborLoader(
+        data_hetero, num_neighbors=params["hop_samples"], batch_size=params["batch_size"],
+        input_nodes=('interaction', test_idx), shuffle=False, subgraph_type='induced',
+        filter_per_worker=False, num_workers=0
+    )
+    
+    # Initialize improved model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Get feature dimensions for proper initialization
+    node_feature_dims = {
+        'siRNA': data_hetero['siRNA'].x.shape[1],
+        'mRNA': data_hetero['mRNA'].x.shape[1], 
+        'interaction': data_hetero['interaction'].x.shape[1]
+    }
+    
+    model = ImprovedHeteroGNN(
+        layer_sizes=params["hinsage_layer_sizes"],
+        out_channels=1,
+        metadata=data_hetero.metadata(),
+        node_feature_dims=node_feature_dims,
+        dropout_rate=params["dropout"],
+        use_attention=True
+    ).to(device)
+    
+    data_hetero = data_hetero.to(device)
+    
+    # Improved optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=params["lr"], weight_decay=1e-4, eps=1e-8)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    criterion = nn.MSELoss() if params["loss"] == "mse" else nn.SmoothL1Loss()
+    
+    early_stopping = EarlyStopping(patience=20)
+    best_val_loss = float('inf')
+    
+    # Training loop
+    for epoch in range(params["epochs"]):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, 
+                                l1_lambda=params.get("l1_lambda", 1e-5))
+        
+        # Validation
+        val_pred, val_true = evaluate(model, val_loader, device)
+        val_loss = F.mse_loss(val_pred.squeeze(-1), val_true).item()
+        
+        scheduler.step()
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), f'best_model_fold{n}.pt')
+        
+        if epoch % 10 == 0:
+            print(f'Epoch: {epoch:03d}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        if early_stopping(val_loss):
+            print(f"Early stopping at epoch {epoch}")
+            break
+    
+    # Load best model and evaluate
+    model.load_state_dict(torch.load(f'best_model_fold{n}.pt'))
+    test_pred, test_true = evaluate(model, test_loader, device)
+    
+    test_pred = test_pred.cpu().numpy().flatten()
+    test_true = test_true.cpu().numpy().flatten()
+    
+    # Filter invalid values
+    valid_mask = ~np.isnan(test_pred) & ~np.isnan(test_true)
+    if not np.any(valid_mask):
+        print("Warning: All predictions are NaN!")
+        continue
+    
+    test_pred = test_pred[valid_mask]
+    test_true = test_true[valid_mask]
+    
+    # Calculate metrics
+    try:
+        r_value, _ = scipy.stats.pearsonr(test_true, test_pred)
+        score_PCC.append(r_value)
+        print("PCC:", r_value)
+        
+        spearman = scipy.stats.spearmanr(test_true, test_pred)
+        score_SPCC.append(spearman[0])
+        print("SPCC:", spearman[0])
+        
+        score_mse.append(mean_squared_error(test_true, test_pred))
+        
+        if len(np.unique(test_true > 0.7)) > 1:
+            score_auc.append(roc_auc_score((test_true > 0.7).astype(int), test_pred))
+    except Exception as e:
+        print(f"Error calculating metrics: {e}")
+        continue
+    
+    print(f"Fold {n} finished!")
+
+# Print final results
+if score_PCC:
+    print(f"\nFinal Results:")
+    print(f"Overall PCC score = {np.mean(score_PCC):.4f} ± {np.std(score_PCC):.4f}")
+    print(f"Overall SPCC score = {np.mean(score_SPCC):.4f} ± {np.std(score_SPCC):.4f}")
+    print(f"Overall MSE score = {np.mean(score_mse):.4f} ± {np.std(score_mse):.4f}")
+    if score_auc:
+        print(f"Overall AUC score = {np.mean(score_auc):.4f} ± {np.std(score_auc):.4f}")
