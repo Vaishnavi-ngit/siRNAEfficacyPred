@@ -1,0 +1,14 @@
+{
+    "n_layers": 3,
+    "initial_hidden_dim": 512,
+    "reduction_factor_layer_1": 4,
+    "reduction_factor_layer_2": 8,
+    "dropout_rate": 0.13968669189192343,
+    "hop_sample_0": 5,
+    "hop_sample_1": 20,
+    "hop_sample_2": 10,
+    "batch_size": 64,
+    "learning_rate": 0.0005797179612927327,
+    "l1_lambda": 1.0275359729007953e-06,
+    "loss_function": "mse"
+}

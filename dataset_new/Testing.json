@@ -1,0 +1,22 @@
+{
+  "sirna_length": 30,
+  "dmodel": 12,
+  "max_mrna_len": 9756,
+  "hinsage_layer_sizes": [256, 128, 64],
+  "lr": 0.001,
+  "epochs": 25,
+  "batch_size": 128,
+  "dropout": 0.3,
+  "hop_samples": [5, 5],
+  "loss": "huber",
+  "huber_delta": 1.0,
+  "l1_lambda": 0.0,
+  "weight_decay": 0.0001,
+  "clip_grad_norm": 1.0,
+  "scheduler_factor": 0.5,
+  "scheduler_patience": 15,
+  "min_lr": 1e-6,
+  "early_stopping_patience": 30,
+  "filter_per_worker": true,
+  "num_workers": 0
+}
