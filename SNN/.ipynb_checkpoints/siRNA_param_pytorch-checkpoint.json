@@ -1,0 +1,10 @@
+{
+  "dmodel": 12,
+  "sirna_length": 30,
+  "max_mrna_len": 9756,
+  "batch_size": 32,
+  "epochs": 10,
+  "dropout": 0.7,
+  "lr": 0.001,
+  "loss": "mse"
+}
