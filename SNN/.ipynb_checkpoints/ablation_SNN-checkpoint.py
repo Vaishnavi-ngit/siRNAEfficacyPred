@@ -340,7 +340,7 @@ for n in range(NUM_FOLDS):
     print("\n--- Assembling GNN Node Features ---")
 
     # siRNA nodes features
-    sirna_pd = pd.concat([sirna_onehot], axis=1)
+    sirna_pd = pd.concat([sirna_onehot , sirna_sfold_feat], axis=1)
 
     # mRNA nodes features
     mrna_pd = pd.concat([mrna_onehot,mrna_sfold_feat,mrna_ago,mrna_GC], axis=1)
