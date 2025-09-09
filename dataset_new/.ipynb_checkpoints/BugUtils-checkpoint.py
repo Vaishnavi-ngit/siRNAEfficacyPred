@@ -9,7 +9,7 @@ logging.set_verbosity_error()
 
 # --- Global Model and Tokenizer Initialization (LOADED ONCE) ---
 # Define the model name
-MP_RNA_MODEL_NAME = "yangheng/MP-RNA"
+"""MP_RNA_MODEL_NAME = "yangheng/MP-RNA"
 
 # Initialize global variables for tokenizer and model
 GLOBAL_MP_RNA_TOKENIZER = None
@@ -31,7 +31,7 @@ except Exception as e:
     print("E_Utils: MP-RNA Transformer will not be available for embedding generation. Returning zero embeddings.")
     # GLOBAL_MP_RNA_TOKENIZER = None
     # GLOBAL_MP_RNA_MODEL = None
-# --- End Global Model Initialization ---
+# --- End Global Model Initialization ---"""
 
 # siRNA position scores - remains unchanged from your original
 position_scores = [
@@ -82,11 +82,11 @@ def obtain_one_hot_feature_for_one_sequence_1(seq1, max_len):
 
 MP_RNA_EMBEDDING_DIM = 256
 
-def get_mp_rna_sequence_embedding(seq: str) -> numpy.ndarray:
-    """
+"""def get_mp_rna_sequence_embedding(seq: str) -> numpy.ndarray:
+    
     Generates a sequence embedding using the pre-trained MP-RNA model.
     Model and tokenizer are loaded globally to ensure efficiency.
-    """
+    
     # If model/tokenizer failed to load globally, or if sequence is empty/invalid, return zeros
     if GLOBAL_MP_RNA_MODEL is None or GLOBAL_MP_RNA_TOKENIZER is None or not isinstance(seq, str) or not seq:
         return numpy.zeros(MP_RNA_EMBEDDING_DIM, dtype=numpy.float32)
@@ -105,7 +105,7 @@ def get_mp_rna_sequence_embedding(seq: str) -> numpy.ndarray:
     sequence_embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
 
     return sequence_embedding
-
+"""
 
 # Positional encoding
 def get_pos_embedding(index, d_model, t):

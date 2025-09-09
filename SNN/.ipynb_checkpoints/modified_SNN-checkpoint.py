@@ -28,6 +28,15 @@ with open("siRNA_param_pytorch.json", 'r') as f:
 MAX_SIRNA_LENGTH = params["sirna_length"]
 MAX_MRNA_LENGTH = params["max_mrna_len"]
 
+# Initialize metric lists
+score_PCC = []
+score_SPCC = []
+score_mse = []
+score_auc = []
+score_f1=[]
+score_recall = []
+score_prec = []
+
 # ------------------------
 # 1. Sequence Encoder
 # ------------------------
@@ -42,25 +51,6 @@ class SequenceEncoder(nn.Module):
         h = F.relu(self.fc1(x))
         h = self.fc2(h)
         return h  # shape: (batch_size, embed_dim)
-
-
-# ------------------------
-# 2. Cross Attention
-# ------------------------
-class CrossAttentionBlock(nn.Module):
-    """
-    siRNA queries attend to mRNA keys/values
-    """
-    def __init__(self, embed_dim, num_heads=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-    def forward(self, siRNA_hidden, mRNA_hidden):
-        # siRNA = queries, mRNA = keys/values
-        out, _ = self.attn(query=siRNA_hidden,
-                           key=mRNA_hidden,
-                           value=mRNA_hidden)
-        return out  # (batch, L_siRNA, embed_dim)
 
 
 # class EfficacyModel(nn.Module):
@@ -350,10 +340,10 @@ for n in range(NUM_FOLDS):
     print("\n--- Assembling GNN Node Features ---")
 
     # siRNA nodes features
-    sirna_pd = pd.concat([sirna_onehot, sirna_sfold_feat, sirna_GC, sirna_k_mers, sirna_pos_scores], axis=1)
+    sirna_pd = pd.concat([sirna_onehot, sirna_sfold_feat, sirna_ago, sirna_GC, sirna_k_mers, sirna_pos_scores], axis=1)
 
     # mRNA nodes features
-    mrna_pd = pd.concat([mrna_onehot, mrna_sfold_feat, mrna_GC], axis=1)
+    mrna_pd = pd.concat([mrna_onehot, mrna_sfold_feat, mrna_ago, mrna_GC], axis=1)
 
     input_dim_mRNA = mrna_pd.shape[1]
     # print(input_dim_mRNA)
@@ -390,7 +380,7 @@ for n in range(NUM_FOLDS):
 
         # Masks
         mrna_mask = torch.zeros(mrna_padded.shape[:2], dtype=torch.bool)
-        sirna_mask = torch.zeros(sirna_padded.shape[:2], dtype=torch.bool)
+        sirna_mask = torch.zeros(sirna_padded.shape[: 2], dtype=torch.bool)
         thermo_mask = torch.zeros(thermo_padded.shape[:2], dtype=torch.bool)
 
         for i, (m, s, t) in enumerate(zip(mrna_list, sirna_list, thermo_list)):
@@ -556,6 +546,7 @@ for n in range(NUM_FOLDS):
 
         return mse, pcc, spcc, auc, f1, precision, recall
 
+        
     
     # --- Main Training Loop ---
     #best_val_loss = float('inf')
@@ -564,12 +555,27 @@ for n in range(NUM_FOLDS):
                  use_contrastive=True, lambda_metric=0.1)
         print(f"Epoch {epoch} | Loss: {loss:.4f}")
 
-        mse,_,_,auc,_,_,_ = validate(model, dev_loader, device="cuda")
+        mse,pcc,spcc,auc,f1,prec,recall = validate(model, dev_loader, device="cuda")
         torch.save(model.state_dict(), f'best_model_fold{n}.pt')
+        if epoch == (params["epochs"]-1):
+            score_PCC.append(pcc)
+            score_SPCC.append(spcc)
+            score_mse.append(mse)
+            score_auc.append(auc)
+            score_f1.append(f1)
+            score_recall.append(recall)
+            score_prec.append(prec)
         
     #print(f"--- Fold {n} finished! Final Validation Loss: {best_val_loss:.4f} ---")
 
 # --- No overall metrics summary since test set evaluation is removed ---
 print("\n--- Training and Validation Complete Across All Folds ---")
+print("Overall MSE score =", np.mean(score_mse))
+print("Overall PCC score =", np.mean(score_PCC))
+print("Overall SPCC score =", np.mean(score_SPCC))
+print("Overall AUC score =", np.mean(score_auc))
+print("Overall F1 score =", np.mean(score_f1))
+print("Overall Presicion score =", np.mean(score_prec))
+print("Overall Recall score =", np.mean(score_recall))
 print("Model checkpoints saved based on best validation loss for each fold.")
 

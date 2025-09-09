@@ -1,0 +1,14 @@
+{
+  "dmodel": 6,
+  "sirna_length": 21,
+  "max_mrna_len": 9756,
+  "batch_size": 16,
+  "epochs": 26,
+  "hinsage_layer_sizes": [64, 64],
+  "hop_samples": [14, 9],
+  "dropout": 0.6489414323496209,
+  "lr": 0.003824895684368415,
+  "loss": "mse",
+  "heads": 4,
+    "gnn_conv_type": "GraphConv"
+}

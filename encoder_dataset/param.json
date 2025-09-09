@@ -1,0 +1,20 @@
+{
+  "sirna_length": 30,
+  "max_mrna_len": 2000,
+  "embedding_dim": 256,
+  "dmodel": 256,
+  "n_head": 8,
+  "n_layers": 4,
+  "gat_heads": 8,
+  "hinsage_layer_sizes": [256, 128, 64],
+  "dropout": 0.2,
+  "batch_size": 128,
+  "hop_samples": [20, 10],
+  "clip_grad_norm": 1.0,
+  "lr": 0.0005,
+  "weight_decay": 0.00001,
+  "epochs": 50,
+  "early_stopping_patience": 50,
+  "loss": "mse",
+  "l1_lambda": 0.0
+}

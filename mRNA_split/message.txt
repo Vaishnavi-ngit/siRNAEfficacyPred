@@ -1,0 +1,1201 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, roc_auc_score
+import scipy
+import scipy.sparse
+import scipy.sparse.linalg
+import matplotlib.pyplot as plt
+import re, json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
+import optuna
+from optuna.trial import TrialState
+import os
+import utils  # Features calculation
+
+# Load parameters
+params = json.load(open("siRNA_param.json", 'r'))
+
+
+# Define PyTorch model classes
+class SAGEConv(nn.Module):
+    """GraphSAGE convolution layer"""
+    def __init__(self, in_feats, out_feats, bias=True):
+        super(SAGEConv, self).__init__()
+        self.linear = nn.Linear(in_feats * 2, out_feats, bias=bias)
+        
+    def forward(self, self_feats, neigh_mean_feats):
+        # Concatenate self and neighbor features
+        h = torch.cat([self_feats, neigh_mean_feats], dim=1)
+        # Apply linear transformation
+        h = self.linear(h)
+        # Apply activation
+        h = F.relu(h)
+        # Normalization
+        h = F.normalize(h, p=2, dim=1)
+        return h
+
+
+class SiRNAEfficacyModel(nn.Module):
+    def __init__(self, feature_dims, hidden_dims, dropout=0.0, activation='relu'):
+        super(SiRNAEfficacyModel, self).__init__()
+        
+        # Save feature dimensions
+        self.feature_dims = feature_dims
+        self.activation = activation
+        
+        # Define node type specific transformations
+        self.node_transforms = nn.ModuleDict({
+            node_type: nn.Linear(dim, hidden_dims[0])
+            for node_type, dim in feature_dims.items()
+        })
+        
+        # GraphSAGE layers
+        self.layers = nn.ModuleList()
+        for i in range(len(hidden_dims) - 1):
+            # Input dimension is the previous hidden dimension
+            in_dim = hidden_dims[i]
+            out_dim = hidden_dims[i + 1]
+            
+            # Define convolutions for each node type
+            convs = nn.ModuleDict({
+                node_type: SAGEConv(in_dim, out_dim)
+                for node_type in feature_dims.keys()
+            })
+            
+            self.layers.append(convs)
+        
+        # Final prediction layer
+        self.predictor = nn.Linear(hidden_dims[-1], 1)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, features, adj_lists):
+        """
+        features: dict of {node_type: tensor of node features}
+        adj_lists: dict of {node_type: dict of {node_idx: list of neighbor indices}}
+        """
+        # Initial transformation for each node type
+        h = {}
+        for node_type in features:
+            x = self.node_transforms[node_type](features[node_type])
+            if self.activation == 'relu':
+                x = F.relu(x)
+            elif self.activation == 'leaky_relu':
+                x = F.leaky_relu(x)
+            elif self.activation == 'elu':
+                x = F.elu(x)
+            h[node_type] = self.dropout(x)
+        
+        # Apply GraphSAGE layers
+        for layer in self.layers:
+            next_h = {}
+            
+            for node_type in features:
+                # Get neighbors
+                neigh_h = self._aggregate_neighbors(h, adj_lists[node_type], node_type)
+                
+                # Apply convolution
+                next_h[node_type] = self.dropout(layer[node_type](h[node_type], neigh_h))
+            
+            h = next_h
+        
+        # Get features for interaction nodes
+        interaction_feats = h["interaction"]
+        
+        # Make predictions
+        pred = self.predictor(interaction_feats)
+        
+        return pred
+        
+    def _aggregate_neighbors(self, h, adj_list, node_type):
+        """
+        Aggregate neighbor features for each node
+        h: dict of {node_type: tensor of node features}
+        adj_list: dict of {node_idx: {neighbor_type: list of neighbor indices}}
+        """
+        # Initialize output tensor with zeros
+        device = next(iter(h.values())).device
+        out_dim = next(iter(h.values())).shape[1]
+        num_nodes = h[node_type].shape[0]
+        
+        # Initialize aggregated features with zeros
+        agg_feats = torch.zeros((num_nodes, out_dim), device=device)
+        
+        # For each node, aggregate its neighbors
+        for node_idx, neighbors in adj_list.items():
+            # Collect neighbor features by type
+            neigh_feats = []
+            for neigh_type, neigh_indices in neighbors.items():
+                if neigh_indices:  # If there are neighbors of this type
+                    type_feats = h[neigh_type][neigh_indices]
+                    if len(type_feats) > 0:
+                        # Mean of features
+                        neigh_feats.append(torch.mean(type_feats, dim=0))
+            
+            # If node has neighbors, set aggregated features
+            if neigh_feats:
+                agg_feats[node_idx] = torch.mean(torch.stack(neigh_feats), dim=0)
+        
+        return agg_feats
+
+
+# Function to prepare adjacency lists
+def prepare_adjacency_lists(node_features, edge_list):
+    """
+    Convert edge list to adjacency lists for each node type
+    """
+    adj_lists = {node_type: {} for node_type in node_features}
+    
+    # Initialize empty neighbor lists for all nodes
+    for node_type, features in node_features.items():
+        for i in range(features.shape[0]):
+            adj_lists[node_type][i] = defaultdict(list)
+    
+    # Add edges to adjacency lists
+    for edge in edge_list:
+        source_type, source_idx = edge[0]
+        target_type, target_idx = edge[1]
+        
+        # Add target as source's neighbor
+        if source_idx < len(node_features[source_type]):
+            adj_lists[source_type][source_idx][target_type].append(target_idx)
+        
+        # Add source as target's neighbor
+        if target_idx < len(node_features[target_type]):
+            adj_lists[target_type][target_idx][source_type].append(source_idx)
+    
+    return adj_lists
+
+
+# Helper function to convert dataframes to PyTorch tensors
+def convert_features_to_tensors(sirna_pd, mrna_pd, interaction_pd):
+    """Convert pandas DataFrames to PyTorch tensors"""
+    node_features = {
+        "siRNA": torch.FloatTensor(sirna_pd.values),
+        "mRNA": torch.FloatTensor(mrna_pd.values),
+        "interaction": torch.FloatTensor(interaction_pd.values)
+    }
+    return node_features
+
+
+# Create edge mappings
+def create_edge_mappings(data, sirna_pd, mrna_pd, interaction_pd):
+    """
+    Create mappings from node IDs to indices in feature tensors
+    """
+    # Create mappings
+    sirna_to_idx = {id: i for i, id in enumerate(sirna_pd.index)}
+    mrna_to_idx = {id: i for i, id in enumerate(mrna_pd.index)}
+    interaction_to_idx = {id: i for i, id in enumerate(interaction_pd.index)}
+    
+    # Create edge list
+    edges = []
+    
+    # Add edges from interaction nodes to siRNA nodes
+    for _, row in data.iterrows():
+        sirna_id = row['siRNA']
+        mrna_id = row['mRNA']
+        interaction_id = sirna_id + "_" + mrna_id
+        
+        if interaction_id in interaction_to_idx and sirna_id in sirna_to_idx:
+            # Interaction -> siRNA edge
+            edges.append((
+                ("interaction", interaction_to_idx[interaction_id]),
+                ("siRNA", sirna_to_idx[sirna_id])
+            ))
+            
+        if interaction_id in interaction_to_idx and mrna_id in mrna_to_idx:
+            # Interaction -> mRNA edge
+            edges.append((
+                ("interaction", interaction_to_idx[interaction_id]),
+                ("mRNA", mrna_to_idx[mrna_id])
+            ))
+    
+    return edges
+
+
+# Function to preprocess data
+def preprocess_data(train_path, dev_path, test_path):
+    """
+    Preprocess data for a single split
+    """
+    # Read file
+    data_train = pd.read_csv(train_path)
+    data_dev = pd.read_csv(dev_path)
+    data_test = pd.read_csv(test_path)
+
+    # Substitute U to T
+    data_train['siRNA_seq'] = data_train['siRNA_seq'].replace('U', 'T', regex=True)
+    data_dev['siRNA_seq'] = data_dev['siRNA_seq'].replace('U', 'T', regex=True)
+    data_test['siRNA_seq'] = data_test['siRNA_seq'].replace('U', 'T', regex=True)
+
+    # Concatenate data
+    data = pd.concat([data_train, data_dev, data_test], axis=0)
+
+    # Feature processing
+    # One-hot encoding
+    # siRNA
+    sirna_onehot = [utils.obtain_one_hot_feature_for_one_sequence_1(seq, params["sirna_length"]) for seq in data['siRNA_seq']]
+    sirna_onehot = pd.DataFrame(sirna_onehot, index=list(data['siRNA']))
+
+    # mRNA
+    mrna_onehot_temp = data.loc[:, ['mRNA', 'mRNA_seq']]
+    mrna_onehot_temp = mrna_onehot_temp.drop_duplicates(subset="mRNA")
+
+    mrna_onehot = [utils.obtain_one_hot_feature_for_one_sequence_1(seq, params["max_mrna_len"]) for seq in mrna_onehot_temp['mRNA_seq']]
+    mrna_onehot = pd.DataFrame(mrna_onehot, index=list(mrna_onehot_temp['mRNA']))
+
+    # Positional encoding
+    trans_table = str.maketrans('ATCG', 'TAGC')
+    data['match_pos'] = [seq[::-1].upper().translate(trans_table) for seq in data['siRNA_seq']]
+    data['match_pos'] = data.apply(lambda row: row['mRNA_seq'].index(row['match_pos']), axis=1)
+
+    sirna_pos_encoding = [utils.get_pos_embedding_sequence(num, params["sirna_length"], params["dmodel"]) for num in data['match_pos']]
+    sirna_pos_encoding = pd.DataFrame(sirna_pos_encoding, index=list(data['siRNA']))
+
+    # Thermodynamics
+    sirna_thermo_feat = [utils.cal_thermo_feature(seq.replace("T", "U")) for seq in data['siRNA_seq']]
+    sirna_thermo_feat = pd.DataFrame(sirna_thermo_feat).reset_index(drop=True)
+    sirna_thermo_feat = pd.concat([data['siRNA'].reset_index(drop=True),
+                                  data['mRNA'].reset_index(drop=True),
+                                  sirna_thermo_feat],
+                                  axis=1)
+    sirna_thermo_feat['index'] = sirna_thermo_feat['siRNA'] + '_' + sirna_thermo_feat['mRNA']
+    sirna_thermo_feat = sirna_thermo_feat.set_index('index').drop(columns=['siRNA', 'mRNA'])
+
+    # Co-fold features
+    con_feat = pd.read_csv("siRNA_split_preprocess/con_matrix.txt", header=None, index_col=0)
+    con_feat = con_feat.reindex(sirna_thermo_feat.index)
+
+    # Self-fold features
+    # siRNA
+    sirna_sfold_feat = pd.read_csv("siRNA_split_preprocess/self_siRNA_matrix.txt", header=None, index_col=0)
+    sirna_sfold_feat = sirna_sfold_feat.reindex(sirna_onehot.index)
+
+    # mRNA
+    mrna_sfold_feat = pd.read_csv("siRNA_split_preprocess/self_mRNA_matrix.txt", header=None, index_col=0)
+    mrna_sfold_feat = mrna_sfold_feat.reindex(mrna_onehot.index)
+
+    # AGO2
+    # siRNA-AGO2
+    sirna_ago = pd.read_csv("RNA_AGO2/siRNA_AGO2.csv", index_col=0)
+    sirna_ago = sirna_ago.reindex(sirna_onehot.index)
+
+    # mRNA-AGO2
+    mrna_ago = pd.read_csv("RNA_AGO2/mRNA_AGO2.csv", index_col=0)
+    mrna_ago = mrna_ago.reindex(mrna_onehot.index)
+
+    # GC percentage
+    # siRNA
+    sirna_GC = [utils.countGC(seq) for seq in data['siRNA_seq']]
+    sirna_GC = pd.DataFrame(sirna_GC, index=list(data['siRNA']))
+
+    # mRNA
+    mrna_GC = [utils.countGC(seq) for seq in mrna_onehot_temp['mRNA_seq']]
+    mrna_GC = pd.DataFrame(mrna_GC, index=list(mrna_onehot_temp['mRNA']))
+
+    # k-mers
+    sirna_1_mer = pd.DataFrame([utils.single_freq(seq) for seq in data['siRNA_seq']])
+    sirna_2_mers = pd.DataFrame([utils.double_freq(seq) for seq in data['siRNA_seq']])
+    sirna_3_mers = pd.DataFrame([utils.triple_freq(seq) for seq in data['siRNA_seq']])
+    sirna_4_mers = pd.DataFrame([utils.quadruple_freq(seq) for seq in data['siRNA_seq']])
+    sirna_5_mers = pd.DataFrame([utils.quintuple_freq(seq) for seq in data['siRNA_seq']])
+
+    sirna_k_mers = pd.concat([sirna_1_mer, sirna_2_mers, sirna_3_mers, sirna_4_mers, sirna_5_mers], axis=1)
+    sirna_k_mers.index = data['siRNA']
+
+    # siRNA rules codes
+    sirna_pos_scores = [utils.rules_scores(seq) for seq in data['siRNA_seq']]
+    sirna_pos_scores = pd.DataFrame(sirna_pos_scores, index=list(data['siRNA']))
+
+    # The features of GNN nodes
+    # siRNA nodes
+    sirna_pd = pd.concat([sirna_onehot, sirna_sfold_feat, sirna_ago, sirna_GC, sirna_k_mers, sirna_pos_scores], axis=1)
+
+    # mRNA nodes
+    mrna_pd = pd.concat([mrna_onehot, mrna_sfold_feat, mrna_ago, mrna_GC], axis=1)
+
+    # interactive nodes
+    sirna_pos_encoding.index = sirna_thermo_feat.index
+    interaction_pd = pd.concat([sirna_thermo_feat, con_feat, sirna_pos_encoding], axis=1)
+    
+    return data_train, data_dev, data_test, data, sirna_pd, mrna_pd, interaction_pd
+
+
+# Optuna objective function for hyperparameter optimization
+def objective(trial, split_idx, data_train, data_dev, sirna_pd, mrna_pd, interaction_pd, device):
+    # Suggest hyperparameters
+    lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    num_layers = trial.suggest_int("num_layers", 2, 4)
+    
+    # Define hidden dimensions
+    first_hidden_dim = trial.suggest_categorical("first_hidden_dim", [64, 128, 256])
+    hidden_dims = [first_hidden_dim]
+    
+    for i in range(num_layers - 1):
+        hidden_dims.append(trial.suggest_categorical(f"hidden_dim_{i+1}", [32, 64, 128]))
+    
+    # Choose activation function
+    activation = trial.suggest_categorical("activation", ["relu", "leaky_relu", "elu"])
+    
+    # Choose loss function
+    loss_type = trial.suggest_categorical("loss", ["mse", "mae"])
+    
+    # Convert features to tensors
+    node_features = convert_features_to_tensors(sirna_pd, mrna_pd, interaction_pd)
+    
+    # Move tensors to device
+    for node_type in node_features:
+        node_features[node_type] = node_features[node_type].to(device)
+    
+    # Create edges and adjacency lists
+    train_edges = create_edge_mappings(data_train, sirna_pd, mrna_pd, interaction_pd)
+    dev_edges = create_edge_mappings(data_dev, sirna_pd, mrna_pd, interaction_pd)
+    
+    # Create adjacency lists
+    train_adj_lists = prepare_adjacency_lists(node_features, train_edges)
+    dev_adj_lists = prepare_adjacency_lists(node_features, dev_edges)
+    
+    # Prepare labels
+    train_labels = torch.FloatTensor(data_train['efficacy'].values).to(device)
+    dev_labels = torch.FloatTensor(data_dev['efficacy'].values).to(device)
+    
+    # Create mapping of interaction IDs to indices
+    interaction_ids = interaction_pd.index
+    interaction_id_to_idx = {id: i for i, id in enumerate(interaction_ids)}
+    
+    # Get indices of interaction nodes for each dataset
+    train_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                     for _, row in data_train.iterrows() 
+                     if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    dev_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                  for _, row in data_dev.iterrows() 
+                  if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    # Define model
+    feature_dims = {
+        "siRNA": sirna_pd.shape[1],
+        "mRNA": mrna_pd.shape[1],
+        "interaction": interaction_pd.shape[1]
+    }
+    
+    # Initialize model with suggested hyperparameters
+    model = SiRNAEfficacyModel(
+        feature_dims=feature_dims,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        activation=activation
+    ).to(device)
+    
+    # Define optimizer with suggested learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Define loss function
+    if loss_type == "mse":
+        criterion = nn.MSELoss()
+    else:
+        criterion = nn.L1Loss()  # MAE loss
+    
+    # Training loop variables
+    n_epochs = trial.suggest_int("epochs", 50, 200)
+    patience = trial.suggest_int("patience", 5, 20)
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128, 256])
+    
+    # Early stopping variables
+    best_val_loss = float('inf')
+    counter = 0
+    
+    # Training loop
+    for epoch in range(n_epochs):
+        # Training
+        model.train()
+        optimizer.zero_grad()
+        
+        # Forward pass
+        train_preds = model(node_features, train_adj_lists)
+        train_preds = train_preds[train_indices].squeeze()
+        
+        # Handle dimension mismatch if needed
+        if len(train_preds.shape) == 0 and len(train_labels) == 1:
+            train_preds = train_preds.unsqueeze(0)
+        
+        loss = criterion(train_preds, train_labels)
+        
+        # Backward and optimize
+        loss.backward()
+        optimizer.step()
+        
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            val_preds = model(node_features, dev_adj_lists)
+            val_preds = val_preds[dev_indices].squeeze()
+            
+            # Handle dimension mismatch if needed
+            if len(val_preds.shape) == 0 and len(dev_labels) == 1:
+                val_preds = val_preds.unsqueeze(0)
+                
+            val_loss = criterion(val_preds, dev_labels)
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+        else:
+            counter += 1
+            if counter >= patience:
+                break
+        
+        # Report intermediate objective value
+        trial.report(val_loss.item(), epoch)
+        
+        # Handle pruning based on the intermediate value
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+    
+    return best_val_loss.item()
+
+
+# Function to train and evaluate the model with optimal hyperparameters
+def train_and_evaluate(params, split_idx, data_train, data_dev, data_test, sirna_pd, mrna_pd, interaction_pd):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Convert features to tensors
+    node_features = convert_features_to_tensors(sirna_pd, mrna_pd, interaction_pd)
+    
+    # Move tensors to device
+    for node_type in node_features:
+        node_features[node_type] = node_features[node_type].to(device)
+    
+    # Create edges and adjacency lists for each dataset
+    train_edges = create_edge_mappings(data_train, sirna_pd, mrna_pd, interaction_pd)
+    dev_edges = create_edge_mappings(data_dev, sirna_pd, mrna_pd, interaction_pd)
+    test_edges = create_edge_mappings(data_test, sirna_pd, mrna_pd, interaction_pd)
+    
+    # Create adjacency lists
+    train_adj_lists = prepare_adjacency_lists(node_features, train_edges)
+    dev_adj_lists = prepare_adjacency_lists(node_features, dev_edges)
+    test_adj_lists = prepare_adjacency_lists(node_features, test_edges)
+    
+    # Prepare labels
+    train_labels = torch.FloatTensor(data_train['efficacy'].values).to(device)
+    dev_labels = torch.FloatTensor(data_dev['efficacy'].values).to(device)
+    test_labels = torch.FloatTensor(data_test['efficacy'].values).to(device)
+    
+    # Create mapping of interaction IDs to indices
+    interaction_ids = interaction_pd.index
+    interaction_id_to_idx = {id: i for i, id in enumerate(interaction_ids)}
+    
+    # Get indices of interaction nodes for each dataset
+    train_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                      for _, row in data_train.iterrows() 
+                      if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    dev_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                    for _, row in data_dev.iterrows() 
+                    if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    test_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                     for _, row in data_test.iterrows() 
+                     if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    # Define model with optimal hyperparameters
+    feature_dims = {
+        "siRNA": sirna_pd.shape[1],
+        "mRNA": mrna_pd.shape[1],
+        "interaction": interaction_pd.shape[1]
+    }
+    
+    # Create model with optimal parameters
+    model = SiRNAEfficacyModel(
+        feature_dims=feature_dims,
+        hidden_dims=params["hidden_dims"],
+        dropout=params["dropout"],
+        activation=params["activation"]
+    ).to(device)
+    
+    # Define optimizer and loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
+    
+    if params["loss"] == "mse":
+        criterion = nn.MSELoss()
+    else:
+        criterion = nn.L1Loss()  # MAE loss
+    
+    # Training loop
+    best_val_loss = float('inf')
+    patience = params["patience"]
+    counter = 0
+    
+    train_losses = []
+    val_losses = []
+    
+    print(f"Starting training for split {split_idx}...")
+    
+    for epoch in range(params["epochs"]):
+        # Training
+        model.train()
+        optimizer.zero_grad()
+        
+        # Forward pass
+        train_preds = model(node_features, train_adj_lists)
+        train_preds = train_preds[train_indices].squeeze()
+        
+        # Handle dimension mismatch if needed
+        if len(train_preds.shape) == 0 and len(train_labels) == 1:
+            train_preds = train_preds.unsqueeze(0)
+            
+        loss = criterion(train_preds, train_labels)
+        
+        # Backward and optimize
+        loss.backward()
+        optimizer.step()
+        
+        train_losses.append(loss.item())
+        
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            val_preds = model(node_features, dev_adj_lists)
+            val_preds = val_preds[dev_indices].squeeze()
+            
+            # Handle dimension mismatch if needed
+            if len(val_preds.shape) == 0 and len(dev_labels) == 1:
+                val_preds = val_preds.unsqueeze(0)
+                
+            val_loss = criterion(val_preds, dev_labels)
+            val_losses.append(val_loss.item())
+        
+        # Print progress
+        if epoch % 10 == 0:
+            print(f"Epoch [{epoch}/{params['epochs']}], "
+                  f"Train Loss: {loss.item():.4f}, "
+                  f"Val Loss: {val_loss.item():.4f}")
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+            # Save best model
+            torch.save(model.state_dict(), f"model_optimized_split{split_idx}.pt")
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+    
+    # Plot training history
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'Training History - Split {split_idx}')
+    plt.legend()
+    plt.savefig(f"training_history_optimized_split{split_idx}.png")
+    
+    # Load best model for evaluation
+    model.load_state_dict(torch.load(f"model_optimized_split{split_idx}.pt"))
+    
+    # Evaluate on the testset
+    model.eval()
+    with torch.no_grad():
+        test_preds = model(node_features, test_adj_lists)
+        test_preds = test_preds[test_indices].squeeze().cpu().numpy()
+        test_true = test_labels.cpu().numpy()
+    
+    # Calculate metrics
+    # PCC
+    pearson = scipy.stats.pearsonr(test_true, test_preds)[0]
+    print(f"PCC: {pearson:.4f}")
+    
+    # SPCC
+    spearman = scipy.stats.spearmanr(test_true, test_preds)[0]
+    print(f"SPCC: {spearman:.4f}")
+    
+    # MSE
+    mse_run = mean_squared_error(test_true, test_preds)
+    print(f"MSE: {mse_run:.4f}")
+    
+    # AUC
+    binary_pred = (test_true > 0.7).astype(int)
+    auc = roc_auc_score(binary_pred, test_preds)
+    print(f"AUC: {auc:.4f}")
+    
+    return pearson, spearman, mse_run, auc
+
+
+# Main execution with Optuna
+def main():
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Results storage
+    score_PCC = []
+    score_SPCC = []
+    score_mse = []
+    score_auc = []
+    
+    # For each split
+    for split_idx in range(10):
+        print(f"Processing split {split_idx}...")
+        
+        # Preprocess data
+        data_train, data_dev, data_test, data, sirna_pd, mrna_pd, interaction_pd = preprocess_data(
+            f"siRNA_split_datasets/split{split_idx}/train.csv",
+            f"siRNA_split_datasets/split{split_idx}/dev.csv",
+            f"siRNA_split_datasets/split{split_idx}/test.csv"
+        )
+        
+        # Create study directory if it doesn't exist
+        os.makedirs("optuna_studies", exist_ok=True)
+        
+        # Create an Optuna study for hyperparameter optimization
+        study_name = f"sirna_efficacy_study_split{split_idx}"
+        storage_name = f"sqlite:///optuna_studies/{study_name}.db"
+        
+        # Create or load study
+        try:
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=storage_name,
+                load_if_exists=True,
+                direction="minimize",
+                pruner=optuna.pruners.MedianPruner()
+            )
+# Check if we already have trials
+        if len(study.trials) == 0 or all(t.state != TrialState.COMPLETE for t in study.trials):
+            print(f"Starting hyperparameter optimization for split {split_idx}...")
+            
+            # Run optimization
+            study.optimize(
+                lambda trial: objective(
+                    trial, split_idx, data_train, data_dev, sirna_pd, mrna_pd, interaction_pd, device
+                ),
+                n_trials=30,  # Adjust based on computational resources
+                timeout=3600,  # 1 hour timeout
+                n_jobs=1
+            )
+            print(f"Best trial for split {split_idx}: {study.best_trial.number}")
+            print(f"Best value: {study.best_trial.value}")
+            print(f"Best hyperparameters: {study.best_trial.params}")
+        else:
+            print(f"Using existing study for split {split_idx}")
+            print(f"Best value: {study.best_value}")
+            print(f"Best hyperparameters: {study.best_params}")
+        
+        # Convert best parameters to a format that can be passed to the model
+        best_params = study.best_params.copy()
+        
+        # Extract hidden dimensions
+        hidden_dims = [best_params.pop("first_hidden_dim")]
+        
+        # Find all hidden_dim keys and add them to hidden_dims list
+        for key in list(best_params.keys()):
+            if key.startswith("hidden_dim_"):
+                hidden_dims.append(best_params.pop(key))
+        
+        # Add hidden_dims to best_params
+        best_params["hidden_dims"] = hidden_dims
+        
+        # Add parameters not optimized by Optuna
+        if "patience" not in best_params:
+            best_params["patience"] = 10
+            
+        print(f"Optimized parameters for split {split_idx}: {best_params}")
+        
+        # Train and evaluate with best hyperparameters
+        pcc, spcc, mse, auc = train_and_evaluate(
+            best_params, split_idx, data_train, data_dev, data_test, sirna_pd, mrna_pd, interaction_pd
+        )
+        
+        # Record results
+        score_PCC.append(pcc)
+        score_SPCC.append(spcc)
+        score_mse.append(mse)
+        score_auc.append(auc)
+        
+        # Optionally visualize the optimization process
+        try:
+            fig = optuna.visualization.plot_optimization_history(study)
+            fig.write_image(f"optuna_history_split{split_idx}.png")
+            
+            fig = optuna.visualization.plot_param_importances(study)
+            fig.write_image(f"optuna_param_importance_split{split_idx}.png")
+            
+            fig = optuna.visualization.plot_contour(study)
+            fig.write_image(f"optuna_contour_split{split_idx}.png")
+        except:
+            print("Could not generate visualization plots. This might be due to missing dependencies.")
+    
+    # Print the average value of metrics
+    print("\n==== FINAL RESULTS ====")
+    print("Overall PCC score = ", np.mean(score_PCC), "±", np.std(score_PCC))
+    print("Overall SPCC score = ", np.mean(score_SPCC), "±", np.std(score_SPCC))
+    print("Overall MSE score = ", np.mean(score_mse), "±", np.std(score_mse))
+    print("Overall AUC score = ", np.mean(score_auc), "±", np.std(score_auc))
+    
+    # Save results to file
+    results = {
+        "PCC_scores": score_PCC,
+        "PCC_mean": np.mean(score_PCC),
+        "PCC_std": np.std(score_PCC),
+        "SPCC_scores": score_SPCC,
+        "SPCC_mean": np.mean(score_SPCC),
+        "SPCC_std": np.std(score_SPCC),
+        "MSE_scores": score_mse,
+        "MSE_mean": np.mean(score_mse),
+        "MSE_std": np.std(score_mse),
+        "AUC_scores": score_auc,
+        "AUC_mean": np.mean(score_auc),
+        "AUC_std": np.std(score_auc)
+    }
+    
+    with open("optuna_optimization_results.json", "w") as f:
+        json.dump(results, f, indent=4)
+
+# Add a new function to perform feature importance analysis
+def analyze_feature_importance(best_params, split_idx):
+    """
+    Analyze feature importance using permutation importance
+    """
+    from sklearn.inspection import permutation_importance
+    
+    # Preprocess data
+    data_train, data_dev, data_test, data, sirna_pd, mrna_pd, interaction_pd = preprocess_data(
+        f"siRNA_split_datasets/split{split_idx}/train.csv",
+        f"siRNA_split_datasets/split{split_idx}/dev.csv",
+        f"siRNA_split_datasets/split{split_idx}/test.csv"
+    )
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load model
+    feature_dims = {
+        "siRNA": sirna_pd.shape[1],
+        "mRNA": mrna_pd.shape[1],
+        "interaction": interaction_pd.shape[1]
+    }
+    
+    model = SiRNAEfficacyModel(
+        feature_dims=feature_dims,
+        hidden_dims=best_params["hidden_dims"],
+        dropout=best_params["dropout"],
+        activation=best_params["activation"]
+    ).to(device)
+    
+    # Load trained weights
+    model.load_state_dict(torch.load(f"model_optimized_split{split_idx}.pt"))
+    model.eval()
+    
+    # Convert features to tensors
+    node_features = convert_features_to_tensors(sirna_pd, mrna_pd, interaction_pd)
+    
+    # Move tensors to device
+    for node_type in node_features:
+        node_features[node_type] = node_features[node_type].to(device)
+    
+    # Create test edges and adjacency lists
+    test_edges = create_edge_mappings(data_test, sirna_pd, mrna_pd, interaction_pd)
+    test_adj_lists = prepare_adjacency_lists(node_features, test_edges)
+    
+    # Get interaction indices for test set
+    interaction_ids = interaction_pd.index
+    interaction_id_to_idx = {id: i for i, id in enumerate(interaction_ids)}
+    
+    test_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                     for _, row in data_test.iterrows() 
+                     if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    # Define feature groups for importance analysis
+    feature_groups = {
+        "siRNA_onehot": list(range(0, 21*4)),  # Assuming 21 nucleotides, 4 bases
+        "siRNA_sfold": list(range(21*4, 21*4 + sirna_sfold_feat.shape[1])),
+        "siRNA_ago": list(range(21*4 + sirna_sfold_feat.shape[1], 
+                               21*4 + sirna_sfold_feat.shape[1] + sirna_ago.shape[1])),
+        # Add other feature groups as needed
+    }
+    
+    results = {}
+    test_true = data_test['efficacy'].values
+    
+    # Define a prediction function for permutation importance
+    def predict(X):
+        # Create a copy of node features
+        node_features_copy = {
+            key: val.clone() if torch.is_tensor(val) else val
+            for key, val in node_features.items()
+        }
+        
+        # Replace siRNA features with permuted ones
+        node_features_copy["siRNA"] = torch.FloatTensor(X).to(device)
+        
+        # Make predictions
+        with torch.no_grad():
+            preds = model(node_features_copy, test_adj_lists)
+            preds = preds[test_indices].squeeze().cpu().numpy()
+        return preds
+    
+    # Calculate permutation importance for siRNA features
+    perm_importance = permutation_importance(
+        predict, sirna_pd.iloc[data_test['siRNA'].map(lambda x: sirna_pd.index.get_loc(x))].values, 
+        test_true, n_repeats=10, random_state=42, n_jobs=-1
+    )
+    
+    # Collect and save results
+    importance_scores = {}
+    for group_name, indices in feature_groups.items():
+        importance_scores[group_name] = perm_importance.importances_mean[indices].mean()
+    
+    # Save to file
+    with open(f"feature_importance_split{split_idx}.json", "w") as f:
+        json.dump(importance_scores, f, indent=4)
+    
+    return importance_scores
+
+# Add a function to perform cross-validation with the best hyperparameters
+def cross_validation(best_params, num_splits=5):
+    """
+    Perform k-fold cross-validation with the best hyperparameters
+    """
+    from sklearn.model_selection import KFold
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Load all data
+    data_all = pd.DataFrame()
+    for split_idx in range(10):
+        data_train = pd.read_csv(f"siRNA_split_datasets/split{split_idx}/train.csv")
+        data_dev = pd.read_csv(f"siRNA_split_datasets/split{split_idx}/dev.csv")
+        data_test = pd.read_csv(f"siRNA_split_datasets/split{split_idx}/test.csv")
+        data_split = pd.concat([data_train, data_dev, data_test], axis=0)
+        data_all = pd.concat([data_all, data_split], axis=0)
+    
+    # Remove duplicates
+    data_all = data_all.drop_duplicates()
+    
+    # Create k-fold cross-validator
+    kf = KFold(n_splits=num_splits, shuffle=True, random_state=42)
+    
+    # Results storage
+    cv_pcc = []
+    cv_spcc = []
+    cv_mse = []
+    cv_auc = []
+    
+    for fold, (train_idx, test_idx) in enumerate(kf.split(data_all)):
+        print(f"Processing fold {fold+1}/{num_splits}...")
+        
+        # Split data
+        data_train_fold = data_all.iloc[train_idx].reset_index(drop=True)
+        data_test_fold = data_all.iloc[test_idx].reset_index(drop=True)
+        
+        # Further split train data into train and validation
+        train_size = int(0.8 * len(data_train_fold))
+        data_train_actual = data_train_fold.iloc[:train_size]
+        data_dev_fold = data_train_fold.iloc[train_size:]
+        
+        # Save temporary CSV files
+        temp_dir = "temp_cv_data"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        data_train_actual.to_csv(f"{temp_dir}/train_fold{fold}.csv", index=False)
+        data_dev_fold.to_csv(f"{temp_dir}/dev_fold{fold}.csv", index=False)
+        data_test_fold.to_csv(f"{temp_dir}/test_fold{fold}.csv", index=False)
+        
+        # Preprocess data
+        data_train, data_dev, data_test, data, sirna_pd, mrna_pd, interaction_pd = preprocess_data(
+            f"{temp_dir}/train_fold{fold}.csv",
+            f"{temp_dir}/dev_fold{fold}.csv",
+            f"{temp_dir}/test_fold{fold}.csv"
+        )
+        
+        # Train and evaluate
+        pcc, spcc, mse, auc = train_and_evaluate(
+            best_params, fold, data_train, data_dev, data_test, sirna_pd, mrna_pd, interaction_pd
+        )
+        
+        # Record results
+        cv_pcc.append(pcc)
+        cv_spcc.append(spcc)
+        cv_mse.append(mse)
+        cv_auc.append(auc)
+    
+    # Print results
+    print("\n==== CROSS-VALIDATION RESULTS ====")
+    print(f"PCC: {np.mean(cv_pcc):.4f} ± {np.std(cv_pcc):.4f}")
+    print(f"SPCC: {np.mean(cv_spcc):.4f} ± {np.std(cv_spcc):.4f}")
+    print(f"MSE: {np.mean(cv_mse):.4f} ± {np.std(cv_mse):.4f}")
+    print(f"AUC: {np.mean(cv_auc):.4f} ± {np.std(cv_auc):.4f}")
+    
+    # Return results
+    return {
+        "PCC": (np.mean(cv_pcc), np.std(cv_pcc)),
+        "SPCC": (np.mean(cv_spcc), np.std(cv_spcc)),
+        "MSE": (np.mean(cv_mse), np.std(cv_mse)),
+        "AUC": (np.mean(cv_auc), np.std(cv_auc))
+    }
+
+# Run feature analysis on best model (optional)
+def run_feature_analysis():
+    """
+    Run feature analysis on the best model
+    """
+    # Load best params from optimization results
+    with open("optuna_optimization_results.json", "r") as f:
+        results = json.load(f)
+    
+    # Find the best split by PCC score
+    best_split = np.argmax(results["PCC_scores"])
+    
+    # Load best parameters for this split
+    study_name = f"sirna_efficacy_study_split{best_split}"
+    storage_name = f"sqlite:///optuna_studies/{study_name}.db"
+    
+    study = optuna.load_study(
+        study_name=study_name,
+        storage=storage_name
+    )
+    
+    best_params = study.best_params.copy()
+    
+    # Extract hidden dimensions
+    hidden_dims = [best_params.pop("first_hidden_dim")]
+    
+    # Find all hidden_dim keys and add them to hidden_dims list
+    for key in list(best_params.keys()):
+        if key.startswith("hidden_dim_"):
+            hidden_dims.append(best_params.pop(key))
+    
+    # Add hidden_dims to best_params
+    best_params["hidden_dims"] = hidden_dims
+    
+    # Add parameters not optimized by Optuna
+    if "patience" not in best_params:
+        best_params["patience"] = 10
+    
+    # Run feature importance analysis
+    importance_scores = analyze_feature_importance(best_params, best_split)
+    
+    print("\n==== FEATURE IMPORTANCE ====")
+    for feature, score in sorted(importance_scores.items(), key=lambda x: x[1], reverse=True):
+        print(f"{feature}: {score:.4f}")
+    
+    return importance_scores
+
+# Add function to evaluate the model on external dataset
+def evaluate_external_dataset(model_path, data_path):
+    """
+    Evaluate the trained model on an external dataset
+    """
+    # Load external data
+    external_data = pd.read_csv(data_path)
+    
+    # Process external data similar to training data
+    data_train, data_dev, data_test, data, sirna_pd, mrna_pd, interaction_pd = preprocess_data(
+        f"siRNA_split_datasets/split0/train.csv",  # Use first split for preprocessing reference
+        f"siRNA_split_datasets/split0/dev.csv",
+        data_path  # Use external data as test set
+    )
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load model
+    model_state = torch.load(model_path, map_location=device)
+    
+    feature_dims = {
+        "siRNA": sirna_pd.shape[1],
+        "mRNA": mrna_pd.shape[1],
+        "interaction": interaction_pd.shape[1]
+    }
+    
+    # Load model configuration from saved file
+    model_config = json.load(open("best_model_config.json", "r"))
+    
+    model = SiRNAEfficacyModel(
+        feature_dims=feature_dims,
+        hidden_dims=model_config["hidden_dims"],
+        dropout=model_config["dropout"],
+        activation=model_config["activation"]
+    ).to(device)
+    
+    model.load_state_dict(model_state)
+    model.eval()
+    
+    # Convert features to tensors
+    node_features = convert_features_to_tensors(sirna_pd, mrna_pd, interaction_pd)
+    
+    # Move tensors to device
+    for node_type in node_features:
+        node_features[node_type] = node_features[node_type].to(device)
+    
+    # Create test edges and adjacency lists
+    test_edges = create_edge_mappings(data_test, sirna_pd, mrna_pd, interaction_pd)
+    test_adj_lists = prepare_adjacency_lists(node_features, test_edges)
+    
+    # Prepare labels
+    test_labels = torch.FloatTensor(data_test['efficacy'].values).to(device)
+    
+    # Get interaction indices for test set
+    interaction_ids = interaction_pd.index
+    interaction_id_to_idx = {id: i for i, id in enumerate(interaction_ids)}
+    
+    test_indices = [interaction_id_to_idx[row['siRNA'] + "_" + row['mRNA']] 
+                    for _, row in data_test.iterrows() 
+                    if row['siRNA'] + "_" + row['mRNA'] in interaction_id_to_idx]
+    
+    # Make predictions
+    with torch.no_grad():
+        test_preds = model(node_features, test_adj_lists)
+        test_preds = test_preds[test_indices].squeeze().cpu().numpy()
+        test_true = test_labels.cpu().numpy()
+    
+    # Calculate metrics
+    pearson = scipy.stats.pearsonr(test_true, test_preds)[0]
+    spearman = scipy.stats.spearmanr(test_true, test_preds)[0]
+    mse = mean_squared_error(test_true, test_preds)
+    
+    binary_pred = (test_true > 0.7).astype(int)
+    auc = roc_auc_score(binary_pred, test_preds)
+    
+    print("\n==== EXTERNAL DATASET EVALUATION ====")
+    print(f"PCC: {pearson:.4f}")
+    print(f"SPCC: {spearman:.4f}")
+    print(f"MSE: {mse:.4f}")
+    print(f"AUC: {auc:.4f}")
+    
+    # Save predictions to file
+    predictions_df = pd.DataFrame({
+        'siRNA': data_test['siRNA'],
+        'mRNA': data_test['mRNA'],
+        'true_efficacy': test_true,
+        'predicted_efficacy': test_preds
+    })
+    
+    predictions_df.to_csv("external_dataset_predictions.csv", index=False)
+    
+    return pearson, spearman, mse, auc
+
+# Function to create a final ensemble model
+def create_ensemble_model():
+    """
+    Create an ensemble model from multiple trained models
+    """
+    # Load the best model from each split
+    model_paths = [f"model_optimized_split{i}.pt" for i in range(10)]
+    
+    # Create a class for ensemble model
+    class EnsembleModel:
+        def __init__(self, model_paths, model_configs):
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.models = []
+            
+            for path, config in zip(model_paths, model_configs):
+                model = SiRNAEfficacyModel(
+                    feature_dims=config["feature_dims"],
+                    hidden_dims=config["hidden_dims"],
+                    dropout=config["dropout"],
+                    activation=config["activation"]
+                ).to(self.device)
+                
+                model.load_state_dict(torch.load(path, map_location=self.device))
+                model.eval()
+                self.models.append(model)
+        
+        def predict(self, node_features, adj_lists, indices):
+            """Make predictions using ensemble of models"""
+            all_preds = []
+            
+            with torch.no_grad():
+                for model in self.models:
+                    preds = model(node_features, adj_lists)
+                    preds = preds[indices].squeeze().cpu().numpy()
+                    all_preds.append(preds)
+            
+            # Average predictions
+            ensemble_preds = np.mean(all_preds, axis=0)
+            return ensemble_preds
+    
+    # Load model configurations
+    model_configs = []
+    for i in range(10):
+        study_name = f"sirna_efficacy_study_split{i}"
+        storage_name = f"sqlite:///optuna_studies/{study_name}.db"
+        
+        study = optuna.load_study(
+            study_name=study_name,
+            storage=storage_name
+        )
+        
+        best_params = study.best_params.copy()
+        
+        # Extract hidden dimensions
+        hidden_dims = [best_params.pop("first_hidden_dim")]
+        
+        # Find all hidden_dim keys and add them to hidden_dims list
+        for key in list(best_params.keys()):
+            if key.startswith("hidden_dim_"):
+                hidden_dims.append(best_params.pop(key))
+        
+        # Load feature dimensions from a sample preprocessing
+        data_train, data_dev, data_test, data, sirna_pd, mrna_pd, interaction_pd = preprocess_data(
+            f"siRNA_split_datasets/split{i}/train.csv",
+            f"siRNA_split_datasets/split{i}/dev.csv",
+            f"siRNA_split_datasets/split{i}/test.csv"
+        )
+        
+        feature_dims = {
+            "siRNA": sirna_pd.shape[1],
+            "mRNA": mrna_pd.shape[1],
+            "interaction": interaction_pd.shape[1]
+        }
+        
+        config = {
+            "feature_dims": feature_dims,
+            "hidden_dims": hidden_dims,
+            "dropout": best_params.get("dropout", 0.1),
+            "activation": best_params.get("activation", "relu")
+        }
+        
+        model_configs.append(config)
+    
+    # Create ensemble model
+    ensemble = EnsembleModel(model_paths, model_configs)
+    
+    # Save the ensemble model
+    with open("ensemble_model.pkl", "wb") as f:
+        import pickle
+        pickle.dump(ensemble, f)
+    
+    print("Ensemble model created and saved successfully!")
+    return ensemble
+
+if __name__ == "__main__":
+    main()
+    
+    # Optional: Run feature analysis
+    # run_feature_analysis()
+    
+    # Optional: Create ensemble model
+    # create_ensemble_model()
+    
+    # Optional: Run cross-validation with best parameters
+    # best_params = json.load(open("best_model_config.json", "r"))
+    # cross_validation(best_params, num_splits=5)

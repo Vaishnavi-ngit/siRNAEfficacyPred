@@ -8,5 +8,13 @@
   "hop_samples": [14, 9],
   "dropout": 0.6,
   "lr": 0.003,
-  "loss": "mse"
+  "weight_decay": 0.0001,
+  "scheduler_factor": 0.5,
+  "scheduler_patience": 15,
+  "min_lr": 1e-06,
+  "early_stopping_patience": 30,
+  "clip_grad_norm": 5.0,
+  "loss": "mse",
+  "filter_per_worker": true,
+"num_workers": 0
 }

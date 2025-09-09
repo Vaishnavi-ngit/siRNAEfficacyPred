@@ -44,25 +44,6 @@ class SequenceEncoder(nn.Module):
         return h  # shape: (batch_size, embed_dim)
 
 
-# ------------------------
-# 2. Cross Attention
-# ------------------------
-class CrossAttentionBlock(nn.Module):
-    """
-    siRNA queries attend to mRNA keys/values
-    """
-    def __init__(self, embed_dim, num_heads=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-    def forward(self, siRNA_hidden, mRNA_hidden):
-        # siRNA = queries, mRNA = keys/values
-        out, _ = self.attn(query=siRNA_hidden,
-                           key=mRNA_hidden,
-                           value=mRNA_hidden)
-        return out  # (batch, L_siRNA, embed_dim)
-
-
 # # ------------------------
 # # 3. Siamese + Fusion Model
 # # ------------------------
@@ -303,6 +284,21 @@ for n in range(10):
         print("Warning: mRNA self-fold feature file 'Simone_split_preprocess/self_mRNA_matrix_Simone_meanSum100.txt' not found. Filling with zeros.")
         mrna_sfold_feat = pd.DataFrame(0.0, index=mrna_embedding_df.index, columns=[f'sfold_mRNA_dim_{i}' for i in range(100)])
 
+    # AGO2
+    ## siRNA-AGO2
+    sirna_ago = pd.read_csv("RNA_AGO2/siRNA_AGO2_zh.csv",index_col = 0)
+
+    sirna_ago = sirna_ago.reindex(sirna_onehot.index)
+    has_nan = sirna_ago.isnull().values.any()
+    print(f"sirna_ago Contains NaN: {has_nan}")
+
+    ## mRNA-AGO2
+    mrna_ago = pd.read_csv("RNA_AGO2/mRNA_AGO2_zh.csv",index_col=0)
+
+    mrna_ago = mrna_ago.reindex(mrna_onehot.index)
+    has_nan = mrna_ago.isnull().values.any()
+    print(f"mrna_ago Contains NaN: {has_nan}")
+
 
     # 8. GC percentage (variable length robust)
     sirna_GC = pd.DataFrame([utils1.countGC(seq) for seq in data_test['siRNA_seq']], index=list(data_test['siRNA']))
@@ -333,10 +329,10 @@ for n in range(10):
     print("\n--- Assembling GNN Node Features ---")
 
     # siRNA nodes features
-    sirna_pd = pd.concat([sirna_onehot, sirna_sfold_feat, sirna_GC, sirna_k_mers, sirna_pos_scores], axis=1)
+    sirna_pd = pd.concat([sirna_onehot, sirna_sfold_feat, sirna_ago, sirna_GC, sirna_k_mers, sirna_pos_scores], axis=1)
 
     # mRNA nodes features
-    mrna_pd = pd.concat([mrna_onehot, mrna_sfold_feat, mrna_GC], axis=1)
+    mrna_pd = pd.concat([mrna_onehot, mrna_sfold_feat, mrna_ago, mrna_GC], axis=1)
 
     input_dim_mRNA = mrna_pd.shape[1]
     # print(input_dim_mRNA)
@@ -406,7 +402,7 @@ for n in range(10):
     model = EfficacyModel(input_dim_mRNA, input_dim_siRNA, input_dim_thermo).cuda()
 
     # Load the saved weights
-    model_path = f"best_model_fold{n}.pt" # <--- IMPORTANT: Ensure this path is correct for your saved models
+    model_path = f"thermo_ago2/best_model_fold{n}.pt" # <--- IMPORTANT: Ensure this path is correct for your saved models
     # model_path = f"best_model_fold1_gcn_75.pt"
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))

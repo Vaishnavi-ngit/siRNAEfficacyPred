@@ -11,6 +11,7 @@
   "loss": "mse",
   "n_splits": 10,
   "random_state": 42,
+  "clip_grad_norm": 5.0,
   "pca_k_mers_n_components": 128,
   "pca_pos_encoding_n_components": 64
 }

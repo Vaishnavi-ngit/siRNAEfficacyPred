@@ -1,0 +1,17 @@
+{
+    "dropout": 0.3335808692894342,
+    "lr": 0.002686428345307291,
+    "epochs": 26,
+    "hinsage_layer_sizes": [64, 64],
+    "l1_lambda": 2.78317710944922e-06,
+    "batch_size": 64,
+    "hop_samples": [9, 8],
+    "loss": "mse",
+    "dmodel": 32,
+    "regional_gc_window": 5,
+    "regional_gc_overlap": 0,
+    "asym_5_prime_len": 5,
+    "asym_3_prime_len": 5,
+    "sirna_length": 21,
+    "max_mrna_len": 9756
+}
